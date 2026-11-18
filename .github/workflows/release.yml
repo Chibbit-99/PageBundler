@@ -1,0 +1,39 @@
+name: Publish extension release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (for example 1.2.0; no leading v)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate version and package extension
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must look like 1.2.3 or 1.2.3-beta.1" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          zip -r "dist/PageBundler-${VERSION}.zip" manifest.json background.js popup.html popup.css popup.js README.md
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release and attach installable ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" "dist/PageBundler-${VERSION}.zip" \
+            --title "PageBundler v${VERSION}" \
+            --notes "Download PageBundler-${VERSION}.zip, extract it, then load the extracted folder from chrome://extensions using Developer mode > Load unpacked."
