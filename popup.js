@@ -21,7 +21,8 @@ function capturePage() {
     try { const url = new URL(value, base); if (url.protocol === 'http:' || url.protocol === 'https:') resources.add(url.href); } catch (_) {}
   };
   for (const el of document.querySelectorAll('[src], [href], [poster], [srcset], [style]')) {
-    for (const attr of ['src', 'href', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
+    for (const attr of ['src', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
+    if (el.hasAttribute('href') && ((el.localName === 'link' && /stylesheet|icon|manifest|preload|modulepreload/i.test(el.rel)) || el.namespaceURI === 'http://www.w3.org/2000/svg')) add(el.getAttribute('href'));
     if (el.hasAttribute('srcset')) for (const entry of el.getAttribute('srcset').split(',')) add(entry.trim().split(/\s+/)[0]);
     if (el.hasAttribute('style')) for (const match of el.getAttribute('style').matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(match[1]);
   }
@@ -55,7 +56,7 @@ button.addEventListener('click', async () => {
     const result = await chrome.runtime.sendMessage({ type: 'bundle-page', data: capture.result });
     if (!result?.ok) throw new Error(result?.error || 'The ZIP could not be created.');
     statusBox.className = 'success'; statusBox.textContent = 'Your page ZIP is ready.';
-    details.hidden = false; details.textContent = `${result.fileCount} files included${result.failed ? ` · ${result.failed} unavailable` : ''}.`;
+    details.hidden = false; details.textContent = `${result.fileCount} files included${result.failed ? ` · ${result.failed} unavailable` : ''}${result.truncated ? ' · asset limit reached; some files were skipped' : ''}.`;
   } catch (error) {
     statusBox.className = 'error'; statusBox.textContent = error.message || 'Something went wrong.';
   } finally { button.disabled = false; }
