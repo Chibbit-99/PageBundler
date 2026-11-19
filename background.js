@@ -45,44 +45,57 @@ function reportProgress(percent, label, indeterminate = false, tabId = null, err
 }
 async function bundle(data, tabId = null) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
-  const queue = [...new Set(data.resources || [])];
+  const maxAssets = 5000, workerCount = 8;
+  const initialResources = [...new Set(data.resources || [])];
+  const queue = initialResources.slice(0, maxAssets);
+  let limitReached = initialResources.length > maxAssets;
+  const scheduled = new Set(queue);
   reportProgress(5, 'Discovering and bundling page assets…', true, tabId);
-  let cursor = 0;
-  for (; cursor < queue.length && cursor < 5000; cursor++) {
-    const url = queue[cursor];
-    if (paths.has(url)) continue;
-    const path = uniquePath(url, used); paths.set(url, path);
-    try {
-      const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.length > 25 * 1024 * 1024) throw new Error('Asset exceeds 25 MB limit');
-      const type = response.headers.get('content-type') || '';
-      if (/text\/css|\.css(?:[?#]|$)/i.test(type + ' ' + url)) {
-        const css = new TextDecoder().decode(bytes);
-        for (const match of css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\()?(["'])([^"']+)\3\)?/gi)) {
-          const raw = match[2] || match[4]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
-          try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); } catch (_) {}
-        }
-        files.push({ name: path, data: css, cssUrl: url });
-      } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
-        const js = new TextDecoder().decode(bytes);
-        const importPattern = /(?:\bimport\s*(?:\([^)]*?\s*)?\s*(?:[^'"()]*(?:\bfrom\s*)?)|\bexport\s+[^'"()]*?\bfrom\s*)["']([^"']+)["']/g;
-        const addJsDependency = raw => {
-          if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) return;
-          try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); } catch (_) {}
-        };
-        for (const match of js.matchAll(importPattern)) addJsDependency(match[1]);
-        // Bundlers often keep lazy chunk paths in lookup tables or new URL(..., import.meta.url)
-        // expressions instead of a literal import(). Capture those local asset references too.
-        for (const match of js.matchAll(/["']((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)["']/gi)) addJsDependency(match[1]);
-        files.push({ name: path, data: js, jsUrl: url });
-      } else files.push({ name: path, data: bytes });
-    } catch (_) { failed.add(url); }
-    reportProgress(5, `Processing assets… ${cursor + 1} of ${queue.length} discovered`, true, tabId);
+  let cursor = 0, completed = 0;
+  const enqueue = url => {
+    if (scheduled.has(url)) return;
+    if (scheduled.size >= maxAssets) { limitReached = true; return; }
+    scheduled.add(url); queue.push(url);
+  };
+  async function processNext() {
+    while (cursor < queue.length && cursor < maxAssets) {
+      const index = cursor++, url = queue[index];
+      if (paths.has(url)) { completed++; continue; }
+      const path = uniquePath(url, used); paths.set(url, path);
+      try {
+        const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length > 25 * 1024 * 1024) throw new Error('Asset exceeds 25 MB limit');
+        const type = response.headers.get('content-type') || '';
+        if (/text\/css|\.css(?:[?#]|$)/i.test(type + ' ' + url)) {
+          const css = new TextDecoder().decode(bytes);
+          for (const match of css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\()?(["'])([^"']+)\3\)?/gi)) {
+            const raw = match[2] || match[4]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
+            try { enqueue(new URL(raw, url).href); } catch (_) {}
+          }
+          files.push({ name: path, data: css, cssUrl: url });
+        } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
+          const js = new TextDecoder().decode(bytes);
+          const importPattern = /(?:\bimport\s*(?:\([^)]*?\s*)?\s*(?:[^'"()]*(?:\bfrom\s*)?)|\bexport\s+[^'"()]*?\bfrom\s*)["']([^"']+)["']/g;
+          const addJsDependency = raw => {
+            if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) return;
+            try { enqueue(new URL(raw, url).href); } catch (_) {}
+          };
+          for (const match of js.matchAll(importPattern)) addJsDependency(match[1]);
+          for (const match of js.matchAll(/["']((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)["']/gi)) addJsDependency(match[1]);
+          files.push({ name: path, data: js, jsUrl: url });
+        } else files.push({ name: path, data: bytes });
+      } catch (_) { failed.add(url); }
+      completed++;
+      if (completed % 8 === 0 || (cursor >= queue.length && completed === cursor)) {
+        reportProgress(5, `Processing assets… ${completed} processed · ${queue.length} discovered`, true, tabId);
+      }
+    }
   }
-  const truncated = cursor < queue.length;
-  reportProgress(88, truncated ? `Asset limit reached (${cursor} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${cursor}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
+  await Promise.all(Array.from({ length: workerCount }, () => processNext()));
+  const truncated = limitReached;
+  reportProgress(88, truncated ? `Asset limit reached (${completed} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${completed}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
