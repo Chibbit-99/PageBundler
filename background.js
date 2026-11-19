@@ -1,4 +1,8 @@
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const MAX_ASSET_BYTES = 25 * 1024 * 1024;
+
+/* ------------------------------------------------------------------ ZIP ---- */
 
 function crc32(bytes) {
   let crc = -1;
@@ -26,6 +30,9 @@ function zipStore(files) {
   ev.setUint32(0, 0x06054b50, true); ev.setUint16(8, files.length, true); ev.setUint16(10, files.length, true); ev.setUint32(12, centralSize, true); ev.setUint32(16, offset, true);
   return new Blob([...locals, ...central, end], { type: 'application/zip' });
 }
+
+/* -------------------------------------------------------------- Filenames -- */
+
 function safeFilename(value) {
   const segment = value.split('/').pop().split('?')[0] || 'asset';
   let decoded = segment;
@@ -38,220 +45,541 @@ function uniquePath(url, used) {
   while (used.has(path)) { const dot = base.lastIndexOf('.'); path = dot > base.indexOf('/') ? `${base.slice(0, dot)}-${i++}${base.slice(dot)}` : `${base}-${i++}`; }
   used.add(path); return path;
 }
+
+/* ------------------------------------------------------------- URL helpers - */
+
+// Query parameters that never change which bytes a URL serves.
+const CACHE_BUSTER_PARAM = /^(?:_+|cb|cache_?bust|cache_?breaker|timestamp|_?ts|utm_.+|fbclid|gclid)$/i;
+
+// The exact URL we request and later rewrite in the captured page. Only the
+// fragment is dropped, so signed/CDN URLs keep the query string they came with.
 function canonicalAssetUrl(value, base) {
   const url = new URL(value, base);
   url.hash = '';
-  // Normalize query ordering and remove common tracking/cache-buster parameters so
-  // repeated references to the same static asset are enqueued only once.
-  url.searchParams.sort();
-  for (const key of [...url.searchParams.keys()]) {
-    if (/^(?:_+|cb|cache_?bust|cache_?breaker|timestamp|_?ts|utm_.+|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
-  }
   return url.href;
 }
+// Identity used to notice that two references point at the same asset: query
+// order and cache-buster values are ignored so repeated references are only
+// downloaded and stored once.
+function resourceKey(url) {
+  const parsed = new URL(url);
+  const params = [...parsed.searchParams.entries()]
+    .filter(([name]) => !CACHE_BUSTER_PARAM.test(name))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const search = new URLSearchParams(params).toString();
+  return parsed.origin + parsed.pathname + (search ? `?${search}` : '');
+}
+const withoutQuery = url => url.split(/[?#]/)[0];
+const isInlineReference = value => !value || /^(?:data:|blob:|about:|javascript:|#)/i.test(value);
+
+function assetKind(type, url) {
+  if (/^text\/css/i.test(type) || /\.css(?:[?#]|$)/i.test(url)) return 'css';
+  if (/image\/svg\+xml/i.test(type) || /\.svg(?:[?#]|$)/i.test(url)) return 'svg';
+  if (/manifest\+json/i.test(type) || /(?:manifest|site)(?:\.webmanifest|\.json)(?:[?#]|$)/i.test(url)) return 'manifest';
+  if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) return 'js';
+  if (/^font\//i.test(type) || /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i.test(url)) return 'font';
+  return 'asset';
+}
+
+/* -------------------------------------------------- Reference collection --- */
+
+const CSS_REFERENCE = /url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\(\s*)?(["'])([^"']+)\3/gi;
+
+function collectCssReferences(css) {
+  const references = [];
+  for (const match of css.matchAll(CSS_REFERENCE)) {
+    const raw = match[2] || match[4];
+    if (!isInlineReference(raw)) references.push(raw);
+  }
+  return references;
+}
+function collectSvgReferences(svg) {
+  const references = collectCssReferences(svg);
+  for (const match of svg.matchAll(/(?:xlink:href|href)\s*=\s*["']([^"']+)["']/gi)) {
+    if (!isInlineReference(match[1])) references.push(match[1]);
+  }
+  return references;
+}
+function collectJsReferences(js) {
+  const patterns = [
+    // import/export ... from "x", bare side-effect imports, dynamic import()
+    /\b(?:import|export)\s*(?:[^'"();\n]*?\bfrom\s*)?["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\bnew\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g,
+    // Worker scripts are loaded at runtime and are part of the page's behaviour.
+    /\bimportScripts\(\s*["']([^"']+)["']\s*\)/g,
+    /\bnew\s+(?:Shared)?Worker\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  const references = [];
+  for (const pattern of patterns) {
+    for (const match of js.matchAll(pattern)) {
+      // Only local or absolute URLs; bare specifiers are resolved by a bundler.
+      if (/^(?:\.{1,2}\/|\/|https?:\/\/)/i.test(match[1])) references.push(match[1]);
+    }
+  }
+  return references;
+}
+
+/* ------------------------------------------------------------ Rewriting ---- */
+
+function localAssetUrl(raw, baseUrl, localPaths, prefix) {
+  let resolved;
+  try { resolved = canonicalAssetUrl(raw, baseUrl); } catch (_) { return raw; }
+  const local = localPaths.get(resolved);
+  return local ? prefix + local.split('/').pop() : raw;
+}
+function rewriteCss(css, stylesheetUrl, localPaths) {
+  return css.replace(CSS_REFERENCE, (whole, quote, raw, importQuote, importRaw) => {
+    if (raw) return `url(${quote}${localAssetUrl(raw, stylesheetUrl, localPaths, './')}${quote})`;
+    return whole.replace(importRaw, localAssetUrl(importRaw, stylesheetUrl, localPaths, './'));
+  });
+}
+function rewriteSvg(svg, svgUrl, localPaths) {
+  return rewriteCss(svg, svgUrl, localPaths).replace(/((?:xlink:)?href\s*=\s*["'])([^"']+)(["'])/gi,
+    (whole, before, raw, after) => (raw.startsWith('#') ? whole : `${before}${localAssetUrl(raw, svgUrl, localPaths, './')}${after}`));
+}
+function rewriteJs(js, scriptUrl, localPaths) {
+  return js.replace(/(["'])((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp|avif|gif|ico|json)(?:[?#][^"']*)?)\1/gi,
+    (whole, quote, raw) => `${quote}${localAssetUrl(raw, scriptUrl, localPaths, './')}${quote}`);
+}
+function rewriteManifest(json, manifestUrl, localPaths) {
+  let manifest;
+  try { manifest = JSON.parse(json); } catch (_) { return json; }
+  const icons = [...(manifest.icons || []), ...(manifest.shortcuts || []).flatMap(item => item.icons || [])];
+  for (const icon of icons) if (icon && icon.src) icon.src = localAssetUrl(icon.src, manifestUrl, localPaths, './');
+  return JSON.stringify(manifest, null, 2);
+}
+
+// Rewrites absolute URLs in the captured markup in a single scan: every URL-like
+// token is looked up whole, so `a.css` is never rewritten inside `a.css?v=2`.
+// Attribute values are escaped by the serializer (`&` -> `&amp;`), so both
+// spellings are mapped; a fragment is carried over to the local path.
+function rewriteHtml(html, localPaths) {
+  if (!localPaths.size) return html;
+  const replacements = new Map();
+  for (const [url, path] of localPaths) {
+    replacements.set(url, path);
+    if (url.includes('&')) replacements.set(url.replace(/&/g, '&amp;'), path);
+  }
+  return html.replace(/https?:\/\/[^\s"'<>()]+/g, match => {
+    const direct = replacements.get(match);
+    if (direct) return direct;
+    const fragment = match.indexOf('#');
+    if (fragment > 0) {
+      const base = replacements.get(match.slice(0, fragment));
+      if (base) return base + match.slice(fragment);
+    }
+    return match;
+  });
+}
+
+/* --------------------------------------------------------------- Hashing --- */
+
+async function contentDigest(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Stores byte-identical assets once. Assets whose contents embed relative URLs
+ * (CSS, JS, SVG, manifests) are only merged with an exact copy of the same URL,
+ * because their references resolve against their own location.
+ */
+async function dedupeFiles(files, paths) {
+  const keeperByDigest = new Map(), duplicates = new Map();
+  for (const file of files) {
+    const bytes = typeof file.data === 'string' ? encoder.encode(file.data) : file.data;
+    if (!(bytes instanceof Uint8Array) || !bytes.length) continue;
+    const scope = file.kind === 'asset' || file.kind === 'font' ? '*' : withoutQuery(file.url);
+    const key = `${scope}|${bytes.length}|${await contentDigest(bytes)}`;
+    const keeper = keeperByDigest.get(key);
+    if (keeper) duplicates.set(file.name, keeper);
+    else keeperByDigest.set(key, file.name);
+  }
+  for (const [url, path] of [...paths]) {
+    const survivor = duplicates.get(path);
+    if (survivor) paths.set(url, survivor);
+  }
+  for (let i = files.length - 1; i >= 0; i--) if (duplicates.has(files[i].name)) files.splice(i, 1);
+  return duplicates.size;
+}
+
+/* -------------------------------------------------------------- Progress --- */
+
+const progressPorts = new Set();
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name !== 'pagebundler-progress') return;
+  progressPorts.add(port);
+  port.onDisconnect.addListener(() => progressPorts.delete(port));
+});
 function reportProgress(percent, label, indeterminate = false, tabId = null, error = false) {
   const message = { type: 'bundle-progress', percent, label, indeterminate, error };
-  const delivery = tabId == null ? chrome.runtime.sendMessage(message) : chrome.tabs.sendMessage(tabId, message);
-  delivery.catch(() => {});
+  if (tabId != null) { try { chrome.tabs.sendMessage(tabId, message).catch(() => {}); } catch (_) {} }
+  for (const port of [...progressPorts]) {
+    try { port.postMessage(message); } catch (_) { progressPorts.delete(port); }
+  }
 }
+
+/* --------------------------------------------------------------- Bundling -- */
+
+class SkippedAsset extends Error {}
+
 async function bundle(data, tabId = null) {
-  const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
+  const used = new Set(['index.html']);
+  const tasks = [];                 // planned downloads, in discovery order
+  const taskByUrl = new Map();
+  const taskByKey = new Map();      // resourceKey -> task, collapses repeated references
+  const aliases = new Map();        // URL that duplicates another -> canonical URL
+  const paths = new Map();          // URL -> local file name
+  const files = [];
+  const failed = new Set();         // could not be fetched
+  const skipped = new Set();        // deliberately not stored (unused, empty, HTML document)
+  const referenced = new Set();     // the page's own markup points here
+  const fromContent = new Set();    // a stylesheet, script, SVG or manifest points here
   const workerCount = 8;
-  const initialResources = [...new Set((data.resources || []).map(value => {
-    try { return canonicalAssetUrl(value); } catch (_) { return null; }
-  }).filter(Boolean))];
-  const queue = initialResources;
-  const scheduled = new Set(queue);
+
+  const resolve = value => { try { return canonicalAssetUrl(value); } catch (_) { return null; } };
+
+  function plan(value) {
+    const url = resolve(value);
+    if (!url) return null;
+    const known = taskByUrl.get(url);
+    if (known) return known.url;
+    const key = resourceKey(url);
+    const duplicate = taskByKey.get(key);
+    if (duplicate) { aliases.set(url, duplicate.url); return duplicate.url; }
+    const task = { url, pageReferenced: false, queued: false };
+    taskByUrl.set(url, task);
+    taskByKey.set(key, task);
+    tasks.push(task);
+    return url;
+  }
+
+  // Download order: everything the markup points at, then hinted code/fonts
+  // (which can pull in more assets), and finally hinted images/media, which are
+  // only downloaded if something still references them by then.
+  const looksRuntimeLoadable = url => /\.(?:m?js|css|woff2?|ttf|otf|eot)(?:[?#]|$)/i.test(url);
+  const queues = [[], [], []];
+  const cursors = [0, 0, 0];
+  let active = 0;
+  let parsing = 0;   // markup/content tasks that may still discover more assets
+  let waiters = [];
+  const wake = () => { const pending = waiters; waiters = []; for (const waiter of pending) waiter(); };
+  const waitForWork = () => new Promise(resolveWait => waiters.push(resolveWait));
+  function enqueue(url, deferred) {
+    const task = taskByUrl.get(url);
+    if (!task || task.queued) return;
+    task.queued = true;
+    const queue = !deferred ? 0 : looksRuntimeLoadable(url) ? 1 : 2;
+    if (queue < 2) parsing++;
+    queues[queue].push(task);
+    wake();
+  }
+  function nextTask() {
+    for (let queue = 0; queue < queues.length; queue++) {
+      // Speculative images are judged only once every stylesheet, script and
+      // font has been parsed and stored.
+      if (queue === 2 && parsing > 0) return null;
+      if (cursors[queue] < queues[queue].length) return { task: queues[queue][cursors[queue]++], speculative: queue === 2 };
+    }
+    return null;
+  }
+
   reportProgress(5, 'Discovering and bundling page assets…', true, tabId);
-  let cursor = 0, completed = 0, lastProgressAt = 0;
-  const enqueue = url => {
-    try { url = canonicalAssetUrl(url); } catch (_) { return; }
-    if (scheduled.has(url)) return;
-    scheduled.add(url); queue.push(url);
-  };
-  async function processNext() {
-    while (cursor < queue.length) {
-      const index = cursor++, url = queue[index];
-      if (paths.has(url)) { completed++; continue; }
-      const path = uniquePath(url, used); paths.set(url, path);
-      try {
-        const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        if (bytes.length > 25 * 1024 * 1024) throw new Error('Asset exceeds 25 MB limit');
-        const type = response.headers.get('content-type') || '';
-        if (/text\/css|\.css(?:[?#]|$)/i.test(type + ' ' + url)) {
-          const css = new TextDecoder().decode(bytes);
-          for (const match of css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\()?(["'])([^"']+)\3\)?/gi)) {
-            const raw = match[2] || match[4]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
-            try { enqueue(new URL(raw, url).href); } catch (_) {}
-          }
-          files.push({ name: path, data: css, cssUrl: url });
-        } else if (/image\/svg\+xml/i.test(type) || /\.svg(?:[?#]|$)/i.test(url)) {
-          const svg = new TextDecoder().decode(bytes);
-          const refs = [...svg.matchAll(/(?:href|xlink:href)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi)];
-          for (const match of refs) {
-            const raw = match[1] || match[2]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
-            try { enqueue(new URL(raw, url).href); } catch (_) {}
-          }
-          files.push({ name: path, data: svg, svgUrl: url });
-        } else if (/manifest\+json/i.test(type) || /(?:manifest|site)(?:\.webmanifest|\.json)(?:[?#]|$)/i.test(url)) {
-          const manifest = JSON.parse(new TextDecoder().decode(bytes));
+
+  const pageReferenced = Array.isArray(data.referenced) ? data.referenced : (data.resources || []);
+  for (const value of pageReferenced) {
+    const url = plan(value);
+    if (!url) continue;
+    referenced.add(url);
+    taskByUrl.get(url).pageReferenced = true;
+  }
+  for (const value of data.resources || []) plan(value);
+  for (const task of tasks) enqueue(task.url, !task.pageReferenced);
+
+  function requireContent(value, base) {
+    let url;
+    try { url = base == null ? value : new URL(value, base).href; } catch (_) { return; }
+    if (isInlineReference(url)) return;
+    const planned = plan(url);
+    if (!planned) return;
+    fromContent.add(planned);
+    enqueue(planned, false);
+  }
+
+  let completed = 0, lastReportAt = 0;
+
+  async function processTask(task) {
+    const url = task.url;
+    const path = uniquePath(url, used);
+    paths.set(url, path);
+    try {
+      const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const type = response.headers.get('content-type') || '';
+      // A sub-document cannot be reproduced offline, so never store one.
+      if (/^text\/html/i.test(type)) throw new SkippedAsset('HTML sub-document');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (!bytes.length) throw new SkippedAsset('Empty asset');
+      if (bytes.length > MAX_ASSET_BYTES) throw new Error('Asset exceeds 25 MB limit');
+      const kind = assetKind(type, url);
+      let text;
+      if (kind === 'css') {
+        text = decoder.decode(bytes);
+        for (const raw of collectCssReferences(text)) requireContent(raw, url);
+        files.push({ name: path, url, kind, data: text });
+      } else if (kind === 'svg') {
+        text = decoder.decode(bytes);
+        for (const raw of collectSvgReferences(text)) requireContent(raw, url);
+        files.push({ name: path, url, kind, data: text });
+      } else if (kind === 'manifest') {
+        text = decoder.decode(bytes);
+        try {
+          const manifest = JSON.parse(text);
           const icons = [...(manifest.icons || []), ...(manifest.shortcuts || []).flatMap(item => item.icons || [])];
-          for (const icon of icons) if (icon.src) try { enqueue(new URL(icon.src, url).href); } catch (_) {}
-          files.push({ name: path, data: JSON.stringify(manifest, null, 2), manifestUrl: url });
-        } else if (/javascript|ecmascript/i.test(type) || /\\.m?js(?:[?#]|$)/i.test(url)) {
-          const js = new TextDecoder().decode(bytes);
-          const staticImportPattern = /\b(?:import|export)\s*(?:[^'"();\n]*?\bfrom\s*)?["']([^"']+)["']/g;
-          const dynamicImportPattern = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
-          const assetUrlPattern = /\bnew\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g;
-          const addJsDependency = raw => {
-            if (!raw || !/^(?:\.{1,2}\/|\/|https?:\/\/)/i.test(raw)) return;
-            try { enqueue(new URL(raw, url).href); } catch (_) {}
-          };
-          for (const match of js.matchAll(staticImportPattern)) addJsDependency(match[1]);
-          for (const match of js.matchAll(dynamicImportPattern)) addJsDependency(match[1]);
-          for (const match of js.matchAll(assetUrlPattern)) addJsDependency(match[1]);
-          files.push({ name: path, data: js, jsUrl: url });
-        } else files.push({ name: path, data: bytes });
-      } catch (_) { failed.add(url); }
-      completed++;
-      const now = Date.now();
-      if (now - lastProgressAt >= 250) {
-        lastProgressAt = now;
-        reportProgress(5, `Processing assets… ${completed} processed · ${queue.length} discovered`, true, tabId);
+          for (const icon of icons) if (icon && icon.src) requireContent(icon.src, url);
+        } catch (_) {}
+        files.push({ name: path, url, kind, data: text });
+      } else if (kind === 'js') {
+        text = decoder.decode(bytes);
+        for (const raw of collectJsReferences(text)) requireContent(raw, url);
+        files.push({ name: path, url, kind, data: text });
+      } else files.push({ name: path, url, kind, data: bytes });
+    } catch (error) {
+      // Leave the original URL in place instead of pointing at a missing file.
+      paths.delete(url);
+      if (error instanceof SkippedAsset) skipped.add(url); else failed.add(url);
+    }
+    completed++;
+  }
+
+  async function worker() {
+    for (;;) {
+      const next = nextTask();
+      if (!next) {
+        if (active === 0) return;
+        await waitForWork();
+        continue;
+      }
+      const { task, speculative } = next;
+      // Speculative hints are only fetched once every markup/content reference
+      // has been parsed, so anything still unreferenced here is not needed by
+      // the page (analytics pixels, prefetches, dead DOM nodes). Code and fonts
+      // are kept because scripts can load them later.
+      if (speculative && !referenced.has(task.url) && !fromContent.has(task.url) && !looksRuntimeLoadable(task.url)) {
+        skipped.add(task.url);
+        completed++;
+        continue;
+      }
+      active++;
+      try { await processTask(task); } finally {
+        active--;
+        if (!speculative) parsing--;
+        wake();
+        const now = Date.now();
+        if (now - lastReportAt >= 250) {
+          lastReportAt = now;
+          reportProgress(5, `Processing assets… ${completed} processed · ${tasks.length} discovered`, true, tabId);
+        }
       }
     }
   }
-  await Promise.all(Array.from({ length: workerCount }, () => processNext()));
-  reportProgress(5, `Asset pass complete: ${completed} processed of ${queue.length} discovered${failed.size ? ` · ${failed.size} unavailable` : ''}`, true, tabId);
-  reportProgress(88, `Assets processed (${completed}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  // Drop speculative loads: analytics beacons, prefetches, assets requested by
+  // DOM nodes that no longer exist. Code, styles and fonts are kept even when
+  // only the Resource Timing API saw them, because scripts can load them later.
+  const runtimeLoadable = new Set(['js', 'css', 'svg', 'manifest', 'font']);
+  for (let i = files.length - 1; i >= 0; i--) {
+    const file = files[i];
+    if (runtimeLoadable.has(file.kind)) continue;
+    if (referenced.has(file.url) || fromContent.has(file.url)) continue;
+    skipped.add(file.url);
+    paths.delete(file.url);
+    files.splice(i, 1);
+  }
+
+  const duplicates = await dedupeFiles(files, paths);
+
+  const localPaths = new Map(paths);
+  for (const [aliasUrl, url] of aliases) {
+    const path = paths.get(url);
+    if (path) localPaths.set(aliasUrl, path);
+  }
+
   for (const file of files) {
-    if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
-    if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
-    if (file.svgUrl) file.data = rewriteSvg(file.data, file.svgUrl, paths);
-    if (file.manifestUrl) {
-      const manifest = JSON.parse(file.data);
-      const icons = [...(manifest.icons || []), ...(manifest.shortcuts || []).flatMap(item => item.icons || [])];
-      for (const icon of icons) if (icon.src) icon.src = localAssetUrl(icon.src, file.manifestUrl, paths, './');
-      file.data = JSON.stringify(manifest, null, 2);
-    }
+    if (file.kind === 'css') file.data = rewriteCss(file.data, file.url, localPaths);
+    else if (file.kind === 'js') file.data = rewriteJs(file.data, file.url, localPaths);
+    else if (file.kind === 'svg') file.data = rewriteSvg(file.data, file.url, localPaths);
+    else if (file.kind === 'manifest') file.data = rewriteManifest(file.data, file.url, localPaths);
   }
-  let html = data.html || '';
-  for (const [url, path] of paths) {
-    if (failed.has(url)) continue;
-    const relative = path;
-    html = html.split(url).join(relative);
-    try { const u = new URL(url); html = html.split(u.origin + u.pathname + u.search + u.hash).join(relative); } catch (_) {}
-  }
-  html = html.replace(/<base\b[^>]*>/i, '');
+
+  let html = rewriteHtml(data.html || '', localPaths);
+  html = html.replace(/<base\b[^>]*>/gi, '');
   files.unshift(
     { name: 'index.html', data: html },
     { name: 'README.txt', data: 'Offline viewing\n\nSome browsers block scripts, fonts, and other resources when an HTML file is opened directly with file://. The assets are included in this archive; serve this folder over localhost instead.\n\n1. Extract the ZIP.\n2. Open a terminal in the extracted folder (the folder containing index.html).\n3. Run: python3 -m http.server 8000\n4. Open http://localhost:8000 in your browser.\n\nOn Windows, use: py -m http.server 8000\nStop the server with Ctrl+C.\n' }
   );
+
+  reportProgress(88, `Assets processed (${completed}) · creating ZIP with ${files.length} files…`, false, tabId);
   const blob = zipStore(files), base64 = await blobToBase64(blob);
   const filename = `${(data.title || 'page').replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 70) || 'page'}.zip`;
   const downloadUrl = `data:application/zip;base64,${base64}`;
   reportProgress(96, 'Starting ZIP download…', false, tabId);
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
   reportProgress(100, 'ZIP ready', false, tabId);
-  return { ok: true, fileCount: files.length, failed: failed.size };
+  return { ok: true, fileCount: files.length, failed: failed.size, skipped: skipped.size, duplicates };
 }
-function localAssetUrl(raw, baseUrl, paths, prefix) {
-  try {
-    const resolved = new URL(raw, baseUrl), local = paths.get(canonicalAssetUrl(raw, baseUrl));
-    return local ? prefix + local.split('/').pop() + resolved.hash : raw;
-  } catch (_) { return raw; }
-}
-function rewriteCss(css, stylesheetUrl, paths) {
-  return css.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)|(@import\s+(?:url\()?)(["'])([^"']+)\4(\)?)/gi,
-    (whole, quote, raw, importStart, importQuote, importRaw, close) => {
-      if (raw) return `url(${quote}${localAssetUrl(raw, stylesheetUrl, paths, './')}${quote})`;
-      return `${importStart}${importQuote}${localAssetUrl(importRaw, stylesheetUrl, paths, './')}${importQuote}${close || ''}`;
-    });
-}
-function rewriteSvg(svg, svgUrl, paths) {
-  const withCss = rewriteCss(svg, svgUrl, paths);
-  return withCss.replace(/((?:xlink:)?href\s*=\s*["'])([^"']+)(["'])/gi, (whole, before, raw, after) => {
-    if (raw.startsWith('#')) return whole;
-    return `${before}${localAssetUrl(raw, svgUrl, paths, './')}${after}`;
-  });
-}
-function rewriteJs(js, scriptUrl, paths) {
-  return js.replace(/(["'])((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)\1/gi,
-    (whole, quote, raw) => `${quote}${localAssetUrl(raw, scriptUrl, paths, './')}${quote}`);
-}
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(blob);
-  });
-}
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'bundle-page') { bundle(message.data, _sender.tab?.id).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message })); return true; }
-});
 
+function blobToBase64(blob) {
+  return blob.arrayBuffer().then(buffer => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(binary);
+  });
+}
+
+/* -------------------------------------------------------------- Capture ---- */
+
+// Injected into the page: serializes the rendered DOM and reports which
+// resources the markup points at (referenced) versus resources that were merely
+// requested while the page ran (resources minus referenced).
 function captureForContextMenu() {
-  const resources = new Set(), base = document.baseURI;
-  const add = value => {
-    if (!value || /^(data:|blob:|javascript:|#)/i.test(value)) return;
-    try { const u = new URL(value, base); if (/^https?:$/.test(u.protocol)) resources.add(u.href); } catch (_) {}
-  };
-  for (const el of document.querySelectorAll('[src],[href],[poster],[srcset],[style]')) {
-    for (const attr of ['src', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
-    if (el.hasAttribute('href') && ((el.localName === 'link' && /stylesheet|icon|manifest|preload|modulepreload/i.test(el.rel)) || el.namespaceURI === 'http://www.w3.org/2000/svg')) add(el.getAttribute('href'));
-    if (el.hasAttribute('srcset')) for (const item of el.getAttribute('srcset').split(',')) add(item.trim().split(/\s+/)[0]);
-    if (el.hasAttribute('style')) for (const m of el.getAttribute('style').matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
-  }
-  for (const style of document.querySelectorAll('style')) for (const m of style.textContent.matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
-  // Include static resources already requested by the page, including lazy-loaded chunks.
-  for (const entry of performance.getEntriesByType('resource')) {
+  // This function is serialized into the page, so it must not use helpers from
+  // this file's scope.
+  const base = document.baseURI;
+  const CSS_REFERENCE = /url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\(\s*)?(["'])([^"']+)\3/gi;
+  const isInlineReference = value => !value || /^(?:data:|blob:|about:|javascript:|#)/i.test(value);
+  const referenced = new Set();
+  const hints = new Set();
+  const normalize = value => {
     try {
-      const resource = new URL(entry.name);
-      if (/\.(?:m?js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico|mp4|webm|mp3|ogg)(?:$|[?#])/i.test(resource.href)) add(resource.href);
-    } catch (_) {}
+      const url = new URL(value, base);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      url.hash = '';
+      return url.href;
+    } catch (_) { return null; }
+  };
+  const add = (value, into = referenced) => {
+    if (isInlineReference(value)) return null;
+    const href = normalize(value);
+    if (href) into.add(href);
+    return href;
+  };
+  const addHint = value => {
+    if (isInlineReference(value)) return;
+    const href = normalize(value);
+    if (href && !referenced.has(href)) hints.add(href);
+  };
+  const addSrcset = (value, into) => {
+    for (const candidate of value.split(',')) {
+      const url = candidate.trim().split(/\s+/)[0];
+      if (url) add(url, into);
+    }
+  };
+  const addCss = (css, into) => {
+    for (const match of css.matchAll(CSS_REFERENCE)) {
+      const raw = match[2] || match[4];
+      if (!isInlineReference(raw)) add(raw, into);
+    }
+  };
+
+  const collected = '[src],[href],[poster],[srcset],[imagesrcset],[style],[data]';
+  for (const el of document.querySelectorAll(collected)) {
+    const name = el.localName;
+    for (const attr of ['src', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
+    if (el.hasAttribute('data') && (name === 'object' || name === 'embed')) add(el.getAttribute('data'));
+    // Only links that the page needs in order to render. Navigation hints
+    // (prefetch, prerender, preconnect, alternate, canonical) are ignored.
+    if (el.hasAttribute('href')) {
+      const rel = (el.getAttribute('rel') || '').toLowerCase();
+      const isStylesheetOrAsset = name === 'link'
+        && /(?:^|\s)(?:stylesheet|icon|apple-touch-icon|manifest|preload|modulepreload)(?:\s|$)/.test(rel);
+      if (isStylesheetOrAsset || el.namespaceURI === 'http://www.w3.org/2000/svg') add(el.getAttribute('href'));
+    }
+    for (const attr of ['srcset', 'imagesrcset']) if (el.hasAttribute(attr)) addSrcset(el.getAttribute(attr));
+    if (el.hasAttribute('style')) addCss(el.getAttribute('style'));
   }
+  for (const style of document.querySelectorAll('style')) addCss(style.textContent);
+
+  // Resources the page requested while running: lazy-loaded chunks, fonts added
+  // by scripts, and also beacons/tracking pixels that no markup points at. The
+  // bundler keeps the former and drops the latter.
+  for (const entry of performance.getEntriesByType('resource')) {
+    if (/^(?:beacon|ping)$/i.test(entry.initiatorType || '')) continue;
+    if (!/\.(?:m?js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico|mp4|webm|mp3|ogg|m4a|vtt)(?:$|[?#])/i.test(entry.name)) continue;
+    addHint(entry.name);
+  }
+
   const snapshot = document.documentElement.cloneNode(true);
-  for (const el of snapshot.querySelectorAll('[src],[href],[poster],[srcset]')) for (const attr of ['src', 'href', 'poster', 'srcset']) {
-    if (!el.hasAttribute(attr)) continue;
-    if (attr === 'srcset') el.setAttribute(attr, el.getAttribute(attr).split(',').map(item => { const p = item.trim().split(/\s+/); try { p[0] = new URL(p[0], base).href; } catch (_) {} return p.join(' '); }).join(', '));
-    else {
-      const raw = el.getAttribute(attr);
-      if (raw.startsWith('#')) continue;
-      try { el.setAttribute(attr, new URL(raw, base).href); } catch (_) {}
+  // The on-page progress widget lives in the DOM while bundling; it is not part
+  // of the page being saved.
+  for (const el of snapshot.querySelectorAll('[id^="pagebundler"]')) el.remove();
+  const absolute = value => { try { return new URL(value, base).href; } catch (_) { return value; } };
+  const absolutizeCss = value => value.replace(CSS_REFERENCE, (whole, quote, raw, importQuote, importRaw) => {
+    if (raw) return `url(${quote}${absolute(raw)}${quote})`;
+    return whole.replace(importRaw, absolute(importRaw));
+  });
+  const absolutize = (value, attr) => {
+    if (attr === 'style') return absolutizeCss(value);
+    if (attr === 'srcset' || attr === 'imagesrcset') {
+      return value.split(',').map(candidate => {
+        const parts = candidate.trim().split(/\s+/);
+        parts[0] = absolute(parts[0]);
+        return parts.join(' ');
+      }).join(', ');
+    }
+    if (value.startsWith('#')) return value;
+    return absolute(value);
+  };
+  for (const el of snapshot.querySelectorAll('[src],[href],[poster],[srcset],[imagesrcset],[style],[data]')) {
+    for (const attr of ['src', 'href', 'poster', 'srcset', 'imagesrcset', 'style', 'data']) {
+      if (el.hasAttribute(attr)) el.setAttribute(attr, absolutize(el.getAttribute(attr), attr));
     }
   }
-  const absolutizeCssUrls = value => value.replace(/url\((["']?)([^"')]+)\1\)/gi, (all, quote, raw) => {
-    try { return `url(${quote}${new URL(raw, base).href}${quote})`; } catch (_) { return all; }
-  });
-  for (const el of snapshot.querySelectorAll('[style]')) el.setAttribute('style', absolutizeCssUrls(el.getAttribute('style')));
-  for (const style of snapshot.querySelectorAll('style')) style.textContent = absolutizeCssUrls(style.textContent);
+  for (const style of snapshot.querySelectorAll('style')) style.textContent = absolutizeCss(style.textContent);
+
   const html = '<!doctype html>\n' + snapshot.outerHTML;
-  return { html, title: document.title || 'page', pageUrl: location.href, resources: [...resources] };
+  return { html, title: document.title || 'page', pageUrl: location.href, referenced: [...referenced], resources: [...referenced, ...hints] };
 }
+
+/* --------------------------------------------------------- Chrome wiring ---- */
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({ id: 'pagebundler-save', title: 'Save page as ZIP with PageBundler', contexts: ['page'] });
 });
-chrome.action.onClicked.addListener(async tab => {
-  if (!tab?.id || !/^https?:/.test(tab.url || '')) return;
-  reportProgress(3, 'Capturing page…', true, tab.id);
-  try {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: captureForContextMenu });
-    if (!result?.result) throw new Error('Could not capture this page.');
-    await bundle(result.result, tab.id);
-  } catch (error) {
-    console.error('PageBundler action failed:', error);
-    reportProgress(0, error.message || 'Could not save this page.', false, tab.id, true);
-  }
+
+async function captureAndBundle(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || !/^https?:/.test(tab.url || '')) throw new Error('This page cannot be captured. Open a regular website and try again.');
+  reportProgress(3, 'Capturing page…', true, tabId);
+  const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: captureForContextMenu });
+  if (!result?.result) throw new Error('Could not read this page. Try refreshing it and retrying.');
+  return bundle(result.result, tabId);
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== 'capture-and-bundle') return;
+  const tabId = message.tabId ?? sender.tab?.id;
+  captureAndBundle(tabId)
+    .then(sendResponse)
+    .catch(error => sendResponse({ ok: false, error: error.message || 'Could not save this page.' }));
+  return true;
 });
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'pagebundler-save' || !tab?.id || !/^https?:/.test(tab.url || '')) return;
-  try {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: captureForContextMenu });
-    if (result?.result) await bundle(result.result, tab.id);
-  } catch (error) {
+chrome.action.onClicked.addListener(tab => {
+  if (!tab?.id) return;
+  captureAndBundle(tab.id).catch(error => {
+    console.error('PageBundler action failed:', error);
+    reportProgress(0, error.message || 'Could not save this page.', false, tab.id, true);
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== 'pagebundler-save' || !tab?.id) return;
+  captureAndBundle(tab.id).catch(error => {
     console.error('PageBundler context-menu capture failed:', error);
     reportProgress(0, error.message || 'Could not save this page.', false, tab.id, true);
-  }
+  });
 });

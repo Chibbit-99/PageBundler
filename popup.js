@@ -5,44 +5,29 @@ const progressWrap = document.getElementById('progress-wrap');
 const progressBar = document.getElementById('progress-bar');
 const progressLabel = document.getElementById('progress-label');
 
-chrome.runtime.onMessage.addListener(message => {
+// Page capture and bundling both happen in the service worker so the popup and
+// the toolbar/context-menu paths always extract assets the same way.
+const progressPort = chrome.runtime.connect({ name: 'pagebundler-progress' });
+progressPort.onMessage.addListener(message => {
   if (message?.type !== 'bundle-progress') return;
+  showProgress(message);
+});
+
+function showProgress(message) {
   progressWrap.hidden = false;
   progressBar.classList.toggle('indeterminate', Boolean(message.indeterminate));
   progressBar.style.width = message.indeterminate ? '38%' : `${Math.max(0, Math.min(100, message.percent || 0))}%`;
   progressLabel.textContent = message.label || 'Working…';
-});
+}
 
-function capturePage() {
-  const base = document.baseURI;
-  const resources = new Set();
-  const add = value => {
-    if (!value || value.startsWith('data:') || value.startsWith('blob:') || value.startsWith('javascript:') || value.startsWith('#')) return;
-    try { const url = new URL(value, base); if (url.protocol === 'http:' || url.protocol === 'https:') resources.add(url.href); } catch (_) {}
-  };
-  for (const el of document.querySelectorAll('[src], [href], [poster], [srcset], [style]')) {
-    for (const attr of ['src', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
-    if (el.hasAttribute('href') && ((el.localName === 'link' && /stylesheet|icon|manifest|preload|modulepreload/i.test(el.rel)) || el.namespaceURI === 'http://www.w3.org/2000/svg')) add(el.getAttribute('href'));
-    if (el.hasAttribute('srcset')) for (const entry of el.getAttribute('srcset').split(',')) add(entry.trim().split(/\s+/)[0]);
-    if (el.hasAttribute('style')) for (const match of el.getAttribute('style').matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(match[1]);
-  }
-  for (const style of document.querySelectorAll('style')) for (const match of style.textContent.matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(match[1]);
-  const snapshot = document.documentElement.cloneNode(true);
-  for (const el of snapshot.querySelectorAll('[src], [href], [poster], [srcset], [style]')) {
-    for (const attr of ['src', 'href', 'poster']) if (el.hasAttribute(attr)) {
-      try { el.setAttribute(attr, new URL(el.getAttribute(attr), base).href); } catch (_) {}
-    }
-    for (const attr of ['srcset', 'style']) if (el.hasAttribute(attr)) {
-      const value = el.getAttribute(attr).replace(/url\\((["']?)([^"')]+)\\1\\)/gi, (all, quote, raw) => {
-        try { return `url(${quote}${new URL(raw, base).href}${quote})`; } catch (_) { return all; }
-      });
-      if (attr === 'srcset') el.setAttribute(attr, value.split(',').map(item => { const parts = item.trim().split(/\\s+/); try { parts[0] = new URL(parts[0], base).href; } catch (_) {} return parts.join(' '); }).join(', '));
-      else el.setAttribute(attr, value);
-    }
-  }
-  for (const style of snapshot.querySelectorAll('style')) style.textContent = style.textContent.replace(/url\\((["']?)([^"')]+)\\1\\)/gi, (all, quote, raw) => { try { return `url(${quote}${new URL(raw, base).href}${quote})`; } catch (_) { return all; } });
-  const html = '<!doctype html>\n' + snapshot.outerHTML;
-  return { html, title: document.title || 'page', pageUrl: location.href, resources: [...resources] };
+function describe(result) {
+  const notes = [
+    `${result.fileCount} files included`,
+    result.duplicates ? `${result.duplicates} duplicates merged` : '',
+    result.skipped ? `${result.skipped} unused skipped` : '',
+    result.failed ? `${result.failed} unavailable` : '',
+  ];
+  return notes.filter(Boolean).join(' · ') + '.';
 }
 
 button.addEventListener('click', async () => {
@@ -51,12 +36,10 @@ button.addEventListener('click', async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id || !/^https?:/.test(tab.url || '')) throw new Error('This page cannot be captured. Open a regular website and try again.');
-    const [capture] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: capturePage });
-    if (!capture?.result) throw new Error('Could not read this page. Try refreshing it and retrying.');
-    const result = await chrome.runtime.sendMessage({ type: 'bundle-page', data: capture.result });
+    const result = await chrome.runtime.sendMessage({ type: 'capture-and-bundle', tabId: tab.id });
     if (!result?.ok) throw new Error(result?.error || 'The ZIP could not be created.');
     statusBox.className = 'success'; statusBox.textContent = 'Your page ZIP is ready.';
-    details.hidden = false; details.textContent = `${result.fileCount} files included${result.failed ? ` · ${result.failed} unavailable` : ''}${result.truncated ? ' · asset limit reached; some files were skipped' : ''}.`;
+    details.hidden = false; details.textContent = describe(result);
   } catch (error) {
     statusBox.className = 'error'; statusBox.textContent = error.message || 'Something went wrong.';
   } finally { button.disabled = false; }
