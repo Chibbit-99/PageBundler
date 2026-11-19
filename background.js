@@ -38,6 +38,11 @@ function uniquePath(url, used) {
   while (used.has(path)) { const dot = base.lastIndexOf('.'); path = dot > base.indexOf('/') ? `${base.slice(0, dot)}-${i++}${base.slice(dot)}` : `${base}-${i++}`; }
   used.add(path); return path;
 }
+function canonicalAssetUrl(value, base) {
+  const url = new URL(value, base);
+  url.hash = '';
+  return url.href;
+}
 function reportProgress(percent, label, indeterminate = false, tabId = null, error = false) {
   const message = { type: 'bundle-progress', percent, label, indeterminate, error };
   const delivery = tabId == null ? chrome.runtime.sendMessage(message) : chrome.tabs.sendMessage(tabId, message);
@@ -45,20 +50,21 @@ function reportProgress(percent, label, indeterminate = false, tabId = null, err
 }
 async function bundle(data, tabId = null) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
-  const maxAssets = 5000, workerCount = 8;
-  const initialResources = [...new Set(data.resources || [])];
-  const queue = initialResources.slice(0, maxAssets);
-  let limitReached = initialResources.length > maxAssets;
+  const workerCount = 8;
+  const initialResources = [...new Set((data.resources || []).map(value => {
+    try { return canonicalAssetUrl(value); } catch (_) { return null; }
+  }).filter(Boolean))];
+  const queue = initialResources;
   const scheduled = new Set(queue);
   reportProgress(5, 'Discovering and bundling page assets…', true, tabId);
-  let cursor = 0, completed = 0;
+  let cursor = 0, completed = 0, lastProgressAt = 0;
   const enqueue = url => {
+    try { url = canonicalAssetUrl(url); } catch (_) { return; }
     if (scheduled.has(url)) return;
-    if (scheduled.size >= maxAssets) { limitReached = true; return; }
     scheduled.add(url); queue.push(url);
   };
   async function processNext() {
-    while (cursor < queue.length && cursor < maxAssets) {
+    while (cursor < queue.length) {
       const index = cursor++, url = queue[index];
       if (paths.has(url)) { completed++; continue; }
       const path = uniquePath(url, used); paths.set(url, path);
@@ -77,25 +83,30 @@ async function bundle(data, tabId = null) {
           files.push({ name: path, data: css, cssUrl: url });
         } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
           const js = new TextDecoder().decode(bytes);
-          const importPattern = /(?:\bimport\s*(?:\([^)]*?\s*)?\s*(?:[^'"()]*(?:\bfrom\s*)?)|\bexport\s+[^'"()]*?\bfrom\s*)["']([^"']+)["']/g;
+          const staticImportPattern = /\b(?:import|export)\s*(?:[^'"();\n]*?\bfrom\s*)?["']([^"']+)["']/g;
+          const dynamicImportPattern = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+          const assetUrlPattern = /\bnew\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g;
           const addJsDependency = raw => {
-            if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) return;
+            if (!raw || !/^(?:\.{1,2}\/|\/|https?:\/\/)/i.test(raw)) return;
             try { enqueue(new URL(raw, url).href); } catch (_) {}
           };
-          for (const match of js.matchAll(importPattern)) addJsDependency(match[1]);
-          for (const match of js.matchAll(/["']((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)["']/gi)) addJsDependency(match[1]);
+          for (const match of js.matchAll(staticImportPattern)) addJsDependency(match[1]);
+          for (const match of js.matchAll(dynamicImportPattern)) addJsDependency(match[1]);
+          for (const match of js.matchAll(assetUrlPattern)) addJsDependency(match[1]);
           files.push({ name: path, data: js, jsUrl: url });
         } else files.push({ name: path, data: bytes });
       } catch (_) { failed.add(url); }
       completed++;
-      if (completed % 8 === 0 || (cursor >= queue.length && completed === cursor)) {
+      const now = Date.now();
+      if (now - lastProgressAt >= 250) {
+        lastProgressAt = now;
         reportProgress(5, `Processing assets… ${completed} processed · ${queue.length} discovered`, true, tabId);
       }
     }
   }
   await Promise.all(Array.from({ length: workerCount }, () => processNext()));
-  const truncated = limitReached;
-  reportProgress(88, truncated ? `Asset limit reached (${completed} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${completed}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
+  reportProgress(5, `Asset pass complete: ${completed} processed of ${queue.length} discovered${failed.size ? ` · ${failed.size} unavailable` : ''}`, true, tabId);
+  reportProgress(88, `Assets processed (${completed}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
@@ -118,11 +129,13 @@ async function bundle(data, tabId = null) {
   reportProgress(96, 'Starting ZIP download…', false, tabId);
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
   reportProgress(100, 'ZIP ready', false, tabId);
-  return { ok: true, fileCount: files.length, failed: failed.size, truncated };
+  return { ok: true, fileCount: files.length, failed: failed.size };
 }
 function localAssetUrl(raw, baseUrl, paths, prefix) {
-  try { const local = paths.get(new URL(raw, baseUrl).href); return local ? prefix + local.split('/').pop() : raw; }
-  catch (_) { return raw; }
+  try {
+    const resolved = new URL(raw, baseUrl), local = paths.get(canonicalAssetUrl(raw, baseUrl));
+    return local ? prefix + local.split('/').pop() + resolved.hash : raw;
+  } catch (_) { return raw; }
 }
 function rewriteCss(css, stylesheetUrl, paths) {
   return css.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)|(@import\s+(?:url\()?)(["'])([^"']+)\4(\)?)/gi,
@@ -157,6 +170,13 @@ function captureForContextMenu() {
     if (el.hasAttribute('style')) for (const m of el.getAttribute('style').matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
   }
   for (const style of document.querySelectorAll('style')) for (const m of style.textContent.matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
+  // Include static resources already requested by the page, including lazy-loaded chunks.
+  for (const entry of performance.getEntriesByType('resource')) {
+    try {
+      const resource = new URL(entry.name);
+      if (/\.(?:m?js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico|mp4|webm|mp3|ogg)(?:$|[?#])/i.test(resource.href)) add(resource.href);
+    } catch (_) {}
+  }
   const snapshot = document.documentElement.cloneNode(true);
   for (const el of snapshot.querySelectorAll('[src],[href],[poster],[srcset]')) for (const attr of ['src', 'href', 'poster', 'srcset']) {
     if (!el.hasAttribute(attr)) continue;
