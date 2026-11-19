@@ -49,18 +49,27 @@ async function bundle(data) {
       if (bytes.length > 25 * 1024 * 1024) throw new Error('Asset exceeds 25 MB limit');
       const type = response.headers.get('content-type') || '';
       if (/text\/css|\.css(?:[?#]|$)/i.test(type + ' ' + url)) {
-        let css = new TextDecoder().decode(bytes);
-        const refs = [...css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\()?(["'])([^"']+)\3\)?/gi)];
-        for (const m of refs) {
-          const raw = m[2] || m[4]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
-          try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); }
-          catch (_) {}
+        const css = new TextDecoder().decode(bytes);
+        for (const match of css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)|@import\s+(?:url\()?(["'])([^"']+)\3\)?/gi)) {
+          const raw = match[2] || match[4]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
+          try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); } catch (_) {}
         }
         files.push({ name: path, data: css, cssUrl: url });
+      } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
+        const js = new TextDecoder().decode(bytes);
+        const importPattern = /(?:\bimport\s*(?:\([^)]*?\s*)?\s*(?:[^'"()]*(?:\bfrom\s*)?)|\bexport\s+[^'"()]*?\bfrom\s*)["']([^"']+)["']/g;
+        for (const match of js.matchAll(importPattern)) {
+          const raw = match[1]; if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) continue;
+          try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); } catch (_) {}
+        }
+        files.push({ name: path, data: js, jsUrl: url });
       } else files.push({ name: path, data: bytes });
     } catch (_) { failed.add(url); }
   }
-  for (const file of files) if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
+  for (const file of files) {
+    if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
+    if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
+  }
   let html = data.html || '';
   for (const [url, path] of paths) {
     if (failed.has(url)) continue;
@@ -69,20 +78,33 @@ async function bundle(data) {
     try { const u = new URL(url); html = html.split(u.origin + u.pathname + u.search + u.hash).join(relative); } catch (_) {}
   }
   html = html.replace(/<base\b[^>]*>/i, '');
-  files.unshift({ name: 'index.html', data: html });
+  files.unshift(
+    { name: 'index.html', data: html },
+    { name: 'README.txt', data: 'Offline viewing\n\nSome browsers block scripts, fonts, and other resources when an HTML file is opened directly with file://. The assets are included in this archive; serve this folder over localhost instead.\n\n1. Extract the ZIP.\n2. Open a terminal in the extracted folder (the folder containing index.html).\n3. Run: python3 -m http.server 8000\n4. Open http://localhost:8000 in your browser.\n\nOn Windows, use: py -m http.server 8000\nStop the server with Ctrl+C.\n' }
+  );
   const blob = zipStore(files), base64 = await blobToBase64(blob);
   const filename = `${(data.title || 'page').replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 70) || 'page'}.zip`;
   const downloadUrl = `data:application/zip;base64,${base64}`;
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
   return { ok: true, fileCount: files.length, failed: failed.size };
 }
+function localAssetUrl(raw, baseUrl, paths, prefix) {
+  try { const local = paths.get(new URL(raw, baseUrl).href); return local ? prefix + local.split('/').pop() : raw; }
+  catch (_) { return raw; }
+}
 function rewriteCss(css, stylesheetUrl, paths) {
-  const replacements = [];
-  for (const [url, path] of paths) {
-    try { if (new URL(url).href) replacements.push([url, '../' + path]); } catch (_) {}
-  }
-  for (const [url, path] of replacements) css = css.split(url).join(path);
-  return css;
+  return css.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)|(@import\s+(?:url\()?)(["'])([^"']+)\4(\)?)/gi,
+    (whole, quote, raw, importStart, importQuote, importRaw, close) => {
+      if (raw) return `url(${quote}${localAssetUrl(raw, stylesheetUrl, paths, '../')}${quote})`;
+      return `${importStart}${importQuote}${localAssetUrl(importRaw, stylesheetUrl, paths, '../')}${importQuote}${close || ''}`;
+    });
+}
+function rewriteJs(js, scriptUrl, paths) {
+  const pattern = /(\b(?:import|export)\s*(?:[^'"()]*?\bfrom\s*)?|\bimport\s*\()(["'])([^"']+)(\2\s*\)?)/g;
+  return js.replace(pattern, (whole, start, quote, raw, end) => {
+    if (/^(data:|blob:|#|[a-z]+:)/i.test(raw)) return whole;
+    return `${start}${quote}${localAssetUrl(raw, scriptUrl, paths, './')}${end}`;
+  });
 }
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
