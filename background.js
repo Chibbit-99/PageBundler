@@ -41,6 +41,12 @@ function uniquePath(url, used) {
 function canonicalAssetUrl(value, base) {
   const url = new URL(value, base);
   url.hash = '';
+  // Normalize query ordering and remove common tracking/cache-buster parameters so
+  // repeated references to the same static asset are enqueued only once.
+  url.searchParams.sort();
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^(?:_+|cb|cache_?bust|cache_?breaker|timestamp|_?ts|utm_.+|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
+  }
   return url.href;
 }
 function reportProgress(percent, label, indeterminate = false, tabId = null, error = false) {
@@ -81,7 +87,20 @@ async function bundle(data, tabId = null) {
             try { enqueue(new URL(raw, url).href); } catch (_) {}
           }
           files.push({ name: path, data: css, cssUrl: url });
-        } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
+        } else if (/image\/svg\+xml/i.test(type) || /\.svg(?:[?#]|$)/i.test(url)) {
+          const svg = new TextDecoder().decode(bytes);
+          const refs = [...svg.matchAll(/(?:href|xlink:href)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi)];
+          for (const match of refs) {
+            const raw = match[1] || match[2]; if (!raw || /^(data:|#|blob:)/i.test(raw)) continue;
+            try { enqueue(new URL(raw, url).href); } catch (_) {}
+          }
+          files.push({ name: path, data: svg, svgUrl: url });
+        } else if (/manifest\+json/i.test(type) || /(?:manifest|site)(?:\.webmanifest|\.json)(?:[?#]|$)/i.test(url)) {
+          const manifest = JSON.parse(new TextDecoder().decode(bytes));
+          const icons = [...(manifest.icons || []), ...(manifest.shortcuts || []).flatMap(item => item.icons || [])];
+          for (const icon of icons) if (icon.src) try { enqueue(new URL(icon.src, url).href); } catch (_) {}
+          files.push({ name: path, data: JSON.stringify(manifest, null, 2), manifestUrl: url });
+        } else if (/javascript|ecmascript/i.test(type) || /\\.m?js(?:[?#]|$)/i.test(url)) {
           const js = new TextDecoder().decode(bytes);
           const staticImportPattern = /\b(?:import|export)\s*(?:[^'"();\n]*?\bfrom\s*)?["']([^"']+)["']/g;
           const dynamicImportPattern = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
@@ -110,6 +129,13 @@ async function bundle(data, tabId = null) {
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
+    if (file.svgUrl) file.data = rewriteSvg(file.data, file.svgUrl, paths);
+    if (file.manifestUrl) {
+      const manifest = JSON.parse(file.data);
+      const icons = [...(manifest.icons || []), ...(manifest.shortcuts || []).flatMap(item => item.icons || [])];
+      for (const icon of icons) if (icon.src) icon.src = localAssetUrl(icon.src, file.manifestUrl, paths, './');
+      file.data = JSON.stringify(manifest, null, 2);
+    }
   }
   let html = data.html || '';
   for (const [url, path] of paths) {
@@ -140,9 +166,16 @@ function localAssetUrl(raw, baseUrl, paths, prefix) {
 function rewriteCss(css, stylesheetUrl, paths) {
   return css.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)|(@import\s+(?:url\()?)(["'])([^"']+)\4(\)?)/gi,
     (whole, quote, raw, importStart, importQuote, importRaw, close) => {
-      if (raw) return `url(${quote}${localAssetUrl(raw, stylesheetUrl, paths, '../')}${quote})`;
-      return `${importStart}${importQuote}${localAssetUrl(importRaw, stylesheetUrl, paths, '../')}${importQuote}${close || ''}`;
+      if (raw) return `url(${quote}${localAssetUrl(raw, stylesheetUrl, paths, './')}${quote})`;
+      return `${importStart}${importQuote}${localAssetUrl(importRaw, stylesheetUrl, paths, './')}${importQuote}${close || ''}`;
     });
+}
+function rewriteSvg(svg, svgUrl, paths) {
+  const withCss = rewriteCss(svg, svgUrl, paths);
+  return withCss.replace(/((?:xlink:)?href\s*=\s*["'])([^"']+)(["'])/gi, (whole, before, raw, after) => {
+    if (raw.startsWith('#')) return whole;
+    return `${before}${localAssetUrl(raw, svgUrl, paths, './')}${after}`;
+  });
 }
 function rewriteJs(js, scriptUrl, paths) {
   return js.replace(/(["'])((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)\1/gi,
@@ -181,8 +214,17 @@ function captureForContextMenu() {
   for (const el of snapshot.querySelectorAll('[src],[href],[poster],[srcset]')) for (const attr of ['src', 'href', 'poster', 'srcset']) {
     if (!el.hasAttribute(attr)) continue;
     if (attr === 'srcset') el.setAttribute(attr, el.getAttribute(attr).split(',').map(item => { const p = item.trim().split(/\s+/); try { p[0] = new URL(p[0], base).href; } catch (_) {} return p.join(' '); }).join(', '));
-    else try { el.setAttribute(attr, new URL(el.getAttribute(attr), base).href); } catch (_) {}
+    else {
+      const raw = el.getAttribute(attr);
+      if (raw.startsWith('#')) continue;
+      try { el.setAttribute(attr, new URL(raw, base).href); } catch (_) {}
+    }
   }
+  const absolutizeCssUrls = value => value.replace(/url\((["']?)([^"')]+)\1\)/gi, (all, quote, raw) => {
+    try { return `url(${quote}${new URL(raw, base).href}${quote})`; } catch (_) { return all; }
+  });
+  for (const el of snapshot.querySelectorAll('[style]')) el.setAttribute('style', absolutizeCssUrls(el.getAttribute('style')));
+  for (const style of snapshot.querySelectorAll('style')) style.textContent = absolutizeCssUrls(style.textContent);
   const html = '<!doctype html>\n' + snapshot.outerHTML;
   return { html, title: document.title || 'page', pageUrl: location.href, resources: [...resources] };
 }
