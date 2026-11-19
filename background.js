@@ -27,7 +27,10 @@ function zipStore(files) {
   return new Blob([...locals, ...central, end], { type: 'application/zip' });
 }
 function safeFilename(value) {
-  return decodeURIComponent(value.split('/').pop().split('?')[0] || 'asset').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-90) || 'asset';
+  const segment = value.split('/').pop().split('?')[0] || 'asset';
+  let decoded = segment;
+  try { decoded = decodeURIComponent(segment); } catch (_) { decoded = segment; }
+  return decoded.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-90) || 'asset';
 }
 function uniquePath(url, used) {
   const base = 'assets/' + safeFilename(new URL(url).pathname);
@@ -35,9 +38,14 @@ function uniquePath(url, used) {
   while (used.has(path)) { const dot = base.lastIndexOf('.'); path = dot > base.indexOf('/') ? `${base.slice(0, dot)}-${i++}${base.slice(dot)}` : `${base}-${i++}`; }
   used.add(path); return path;
 }
+function reportProgress(percent, label) {
+  chrome.runtime.sendMessage({ type: 'bundle-progress', percent, label }).catch(() => {});
+}
 async function bundle(data) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
   const queue = [...new Set(data.resources || [])];
+  let maxPercent = 5;
+  reportProgress(5, 'Preparing page assets…');
   for (let cursor = 0; cursor < queue.length && cursor < 1000; cursor++) {
     const url = queue[cursor];
     if (paths.has(url)) continue;
@@ -65,7 +73,10 @@ async function bundle(data) {
         files.push({ name: path, data: js, jsUrl: url });
       } else files.push({ name: path, data: bytes });
     } catch (_) { failed.add(url); }
+    maxPercent = Math.max(maxPercent, Math.min(88, 5 + Math.floor(83 * (cursor + 1) / Math.max(queue.length, cursor + 1))));
+    reportProgress(maxPercent, `Bundling assets… ${cursor + 1} of ${queue.length}`);
   }
+  reportProgress(91, 'Writing ZIP archive…');
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
@@ -85,7 +96,9 @@ async function bundle(data) {
   const blob = zipStore(files), base64 = await blobToBase64(blob);
   const filename = `${(data.title || 'page').replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 70) || 'page'}.zip`;
   const downloadUrl = `data:application/zip;base64,${base64}`;
+  reportProgress(96, 'Starting ZIP download…');
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
+  reportProgress(100, 'ZIP ready');
   return { ok: true, fileCount: files.length, failed: failed.size };
 }
 function localAssetUrl(raw, baseUrl, paths, prefix) {
