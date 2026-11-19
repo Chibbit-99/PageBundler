@@ -5,6 +5,7 @@
   "description": "Save a web page and its attached files into a ZIP archive.",
   "permissions": ["activeTab", "scripting", "downloads", "contextMenus"],
   "host_permissions": ["<all_urls>"],
-  "action": { "default_popup": "popup.html", "default_title": "Save page as ZIP" },
+  "action": { "default_title": "Save page as ZIP" },
+  "content_scripts": [{ "matches": ["http://*/*", "https://*/*"], "js": ["page-progress.js"], "run_at": "document_idle" }],
   "background": { "service_worker": "background.js" }
 }

@@ -38,13 +38,15 @@ function uniquePath(url, used) {
   while (used.has(path)) { const dot = base.lastIndexOf('.'); path = dot > base.indexOf('/') ? `${base.slice(0, dot)}-${i++}${base.slice(dot)}` : `${base}-${i++}`; }
   used.add(path); return path;
 }
-function reportProgress(percent, label, indeterminate = false) {
-  chrome.runtime.sendMessage({ type: 'bundle-progress', percent, label, indeterminate }).catch(() => {});
+function reportProgress(percent, label, indeterminate = false, tabId = null, error = false) {
+  const message = { type: 'bundle-progress', percent, label, indeterminate, error };
+  const delivery = tabId == null ? chrome.runtime.sendMessage(message) : chrome.tabs.sendMessage(tabId, message);
+  delivery.catch(() => {});
 }
-async function bundle(data) {
+async function bundle(data, tabId = null) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
   const queue = [...new Set(data.resources || [])];
-  reportProgress(5, 'Discovering and bundling page assets…', true);
+  reportProgress(5, 'Discovering and bundling page assets…', true, tabId);
   let cursor = 0;
   for (; cursor < queue.length && cursor < 5000; cursor++) {
     const url = queue[cursor];
@@ -77,10 +79,10 @@ async function bundle(data) {
         files.push({ name: path, data: js, jsUrl: url });
       } else files.push({ name: path, data: bytes });
     } catch (_) { failed.add(url); }
-    reportProgress(5, `Processing assets… ${cursor + 1} of ${queue.length} discovered`, true);
+    reportProgress(5, `Processing assets… ${cursor + 1} of ${queue.length} discovered`, true, tabId);
   }
   const truncated = cursor < queue.length;
-  reportProgress(88, truncated ? `Asset limit reached (${cursor} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${cursor}) · creating ZIP with ${files.length + 2} files…`);
+  reportProgress(88, truncated ? `Asset limit reached (${cursor} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${cursor}) · creating ZIP with ${files.length + 2} files…`, false, tabId);
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
@@ -100,9 +102,9 @@ async function bundle(data) {
   const blob = zipStore(files), base64 = await blobToBase64(blob);
   const filename = `${(data.title || 'page').replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 70) || 'page'}.zip`;
   const downloadUrl = `data:application/zip;base64,${base64}`;
-  reportProgress(96, 'Starting ZIP download…');
+  reportProgress(96, 'Starting ZIP download…', false, tabId);
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
-  reportProgress(100, 'ZIP ready');
+  reportProgress(100, 'ZIP ready', false, tabId);
   return { ok: true, fileCount: files.length, failed: failed.size, truncated };
 }
 function localAssetUrl(raw, baseUrl, paths, prefix) {
@@ -126,7 +128,7 @@ function blobToBase64(blob) {
   });
 }
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'bundle-page') { bundle(message.data).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message })); return true; }
+  if (message?.type === 'bundle-page') { bundle(message.data, _sender.tab?.id).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message })); return true; }
 });
 
 function captureForContextMenu() {
@@ -155,12 +157,26 @@ function captureForContextMenu() {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({ id: 'pagebundler-save', title: 'Save page as ZIP with PageBundler', contexts: ['page'] });
 });
+chrome.action.onClicked.addListener(async tab => {
+  if (!tab?.id || !/^https?:/.test(tab.url || '')) return;
+  reportProgress(3, 'Capturing page…', true, tab.id);
+  try {
+    const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: captureForContextMenu });
+    if (!result?.result) throw new Error('Could not capture this page.');
+    await bundle(result.result, tab.id);
+  } catch (error) {
+    console.error('PageBundler action failed:', error);
+    reportProgress(0, error.message || 'Could not save this page.', false, tab.id, true);
+  }
+});
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== 'pagebundler-save' || !tab?.id || !/^https?:/.test(tab.url || '')) return;
   try {
     const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: captureForContextMenu });
-    if (result?.result) await bundle(result.result);
+    if (result?.result) await bundle(result.result, tab.id);
   } catch (error) {
     console.error('PageBundler context-menu capture failed:', error);
+    reportProgress(0, error.message || 'Could not save this page.', false, tab.id, true);
   }
 });
