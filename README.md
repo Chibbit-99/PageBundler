@@ -5,7 +5,7 @@ A Chrome Manifest V3 extension that saves the current page as a ZIP containing `
 ## Load in Chrome
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Choose **Load unpacked** and select this repository directory.
-3. Navigate to a page and click the PageBundler toolbar button, then **Save page as ZIP**. You can also right-click anywhere on the page and choose **Save page as ZIP with PageBundler**.
+3. Navigate to a page and click the PageBundler toolbar icon to save it directly; an on-page progress indicator shows the bundling status. You can also right-click anywhere on the page and choose **Save page as ZIP with PageBundler**.
 
 The extension captures the rendered DOM, downloads referenced scripts, stylesheets, images, fonts and media where the site permits it, rewrites references to local files, and downloads a ZIP. Some pages use protected resources, authentication, or runtime-generated content that cannot be reproduced offline; failed assets are reported in the popup. Browser-internal pages and the Chrome Web Store cannot be captured.
 
