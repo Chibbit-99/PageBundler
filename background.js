@@ -45,7 +45,8 @@ async function bundle(data) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
   const queue = [...new Set(data.resources || [])];
   reportProgress(5, 'Discovering and bundling page assets…', true);
-  for (let cursor = 0; cursor < queue.length && cursor < 1000; cursor++) {
+  let cursor = 0;
+  for (; cursor < queue.length && cursor < 5000; cursor++) {
     const url = queue[cursor];
     if (paths.has(url)) continue;
     const path = uniquePath(url, used); paths.set(url, path);
@@ -76,9 +77,10 @@ async function bundle(data) {
         files.push({ name: path, data: js, jsUrl: url });
       } else files.push({ name: path, data: bytes });
     } catch (_) { failed.add(url); }
-    reportProgress(5, `Bundling assets… ${cursor + 1} fetched · ${queue.length} discovered`, true);
+    reportProgress(5, `Processing assets… ${cursor + 1} of ${queue.length} discovered`, true);
   }
-  reportProgress(88, `Assets collected · creating ZIP with ${files.length + 2} files…`);
+  const truncated = cursor < queue.length;
+  reportProgress(88, truncated ? `Asset limit reached (${cursor} processed of ${queue.length} discovered) · creating ZIP…` : `Assets processed (${cursor}) · creating ZIP with ${files.length + 2} files…`);
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
@@ -101,7 +103,7 @@ async function bundle(data) {
   reportProgress(96, 'Starting ZIP download…');
   await chrome.downloads.download({ url: downloadUrl, filename, saveAs: true });
   reportProgress(100, 'ZIP ready');
-  return { ok: true, fileCount: files.length, failed: failed.size };
+  return { ok: true, fileCount: files.length, failed: failed.size, truncated };
 }
 function localAssetUrl(raw, baseUrl, paths, prefix) {
   try { const local = paths.get(new URL(raw, baseUrl).href); return local ? prefix + local.split('/').pop() : raw; }
@@ -134,7 +136,8 @@ function captureForContextMenu() {
     try { const u = new URL(value, base); if (/^https?:$/.test(u.protocol)) resources.add(u.href); } catch (_) {}
   };
   for (const el of document.querySelectorAll('[src],[href],[poster],[srcset],[style]')) {
-    for (const attr of ['src', 'href', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
+    for (const attr of ['src', 'poster']) if (el.hasAttribute(attr)) add(el.getAttribute(attr));
+    if (el.hasAttribute('href') && ((el.localName === 'link' && /stylesheet|icon|manifest|preload|modulepreload/i.test(el.rel)) || el.namespaceURI === 'http://www.w3.org/2000/svg')) add(el.getAttribute('href'));
     if (el.hasAttribute('srcset')) for (const item of el.getAttribute('srcset').split(',')) add(item.trim().split(/\s+/)[0]);
     if (el.hasAttribute('style')) for (const m of el.getAttribute('style').matchAll(/url\(["']?([^"')]+)["']?\)/gi)) add(m[1]);
   }
