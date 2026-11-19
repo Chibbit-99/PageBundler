@@ -8,7 +8,8 @@ const progressLabel = document.getElementById('progress-label');
 chrome.runtime.onMessage.addListener(message => {
   if (message?.type !== 'bundle-progress') return;
   progressWrap.hidden = false;
-  progressBar.style.width = `${Math.max(0, Math.min(100, message.percent || 0))}%`;
+  progressBar.classList.toggle('indeterminate', Boolean(message.indeterminate));
+  progressBar.style.width = message.indeterminate ? '38%' : `${Math.max(0, Math.min(100, message.percent || 0))}%`;
   progressLabel.textContent = message.label || 'Working…';
 });
 
@@ -45,7 +46,7 @@ function capturePage() {
 
 button.addEventListener('click', async () => {
   button.disabled = true; statusBox.className = ''; statusBox.textContent = 'Capturing page and bundling files…'; details.hidden = true;
-  progressWrap.hidden = false; progressBar.style.width = '2%'; progressLabel.textContent = 'Capturing page…';
+  progressWrap.hidden = false; progressBar.classList.add('indeterminate'); progressBar.style.width = '38%'; progressLabel.textContent = 'Capturing page…';
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id || !/^https?:/.test(tab.url || '')) throw new Error('This page cannot be captured. Open a regular website and try again.');

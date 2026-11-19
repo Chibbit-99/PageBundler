@@ -38,14 +38,13 @@ function uniquePath(url, used) {
   while (used.has(path)) { const dot = base.lastIndexOf('.'); path = dot > base.indexOf('/') ? `${base.slice(0, dot)}-${i++}${base.slice(dot)}` : `${base}-${i++}`; }
   used.add(path); return path;
 }
-function reportProgress(percent, label) {
-  chrome.runtime.sendMessage({ type: 'bundle-progress', percent, label }).catch(() => {});
+function reportProgress(percent, label, indeterminate = false) {
+  chrome.runtime.sendMessage({ type: 'bundle-progress', percent, label, indeterminate }).catch(() => {});
 }
 async function bundle(data) {
   const used = new Set(['index.html']), paths = new Map(), files = [], failed = new Set();
   const queue = [...new Set(data.resources || [])];
-  let maxPercent = 5;
-  reportProgress(5, 'Preparing page assets…');
+  reportProgress(5, 'Discovering and bundling page assets…', true);
   for (let cursor = 0; cursor < queue.length && cursor < 1000; cursor++) {
     const url = queue[cursor];
     if (paths.has(url)) continue;
@@ -66,17 +65,20 @@ async function bundle(data) {
       } else if (/javascript|ecmascript/i.test(type) || /\.m?js(?:[?#]|$)/i.test(url)) {
         const js = new TextDecoder().decode(bytes);
         const importPattern = /(?:\bimport\s*(?:\([^)]*?\s*)?\s*(?:[^'"()]*(?:\bfrom\s*)?)|\bexport\s+[^'"()]*?\bfrom\s*)["']([^"']+)["']/g;
-        for (const match of js.matchAll(importPattern)) {
-          const raw = match[1]; if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) continue;
+        const addJsDependency = raw => {
+          if (!raw || /^(data:|blob:|#|[a-z]+:)/i.test(raw)) return;
           try { const absolute = new URL(raw, url).href; if (!queue.includes(absolute)) queue.push(absolute); } catch (_) {}
-        }
+        };
+        for (const match of js.matchAll(importPattern)) addJsDependency(match[1]);
+        // Bundlers often keep lazy chunk paths in lookup tables or new URL(..., import.meta.url)
+        // expressions instead of a literal import(). Capture those local asset references too.
+        for (const match of js.matchAll(/["']((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)["']/gi)) addJsDependency(match[1]);
         files.push({ name: path, data: js, jsUrl: url });
       } else files.push({ name: path, data: bytes });
     } catch (_) { failed.add(url); }
-    maxPercent = Math.max(maxPercent, Math.min(88, 5 + Math.floor(83 * (cursor + 1) / Math.max(queue.length, cursor + 1))));
-    reportProgress(maxPercent, `Bundling assets… ${cursor + 1} of ${queue.length}`);
+    reportProgress(5, `Bundling assets… ${cursor + 1} fetched · ${queue.length} discovered`, true);
   }
-  reportProgress(91, 'Writing ZIP archive…');
+  reportProgress(88, `Assets collected · creating ZIP with ${files.length + 2} files…`);
   for (const file of files) {
     if (file.cssUrl) file.data = rewriteCss(file.data, file.cssUrl, paths);
     if (file.jsUrl) file.data = rewriteJs(file.data, file.jsUrl, paths);
@@ -113,11 +115,8 @@ function rewriteCss(css, stylesheetUrl, paths) {
     });
 }
 function rewriteJs(js, scriptUrl, paths) {
-  const pattern = /(\b(?:import|export)\s*(?:[^'"()]*?\bfrom\s*)?|\bimport\s*\()(["'])([^"']+)(\2\s*\)?)/g;
-  return js.replace(pattern, (whole, start, quote, raw, end) => {
-    if (/^(data:|blob:|#|[a-z]+:)/i.test(raw)) return whole;
-    return `${start}${quote}${localAssetUrl(raw, scriptUrl, paths, './')}${end}`;
-  });
+  return js.replace(/(["'])((?:\.{1,2}\/|\/)?[^"'\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|svg|webp)(?:[?#][^"']*)?)\1/gi,
+    (whole, quote, raw) => `${quote}${localAssetUrl(raw, scriptUrl, paths, './')}${quote}`);
 }
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
